@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "blend_kernels.cuh"
+
+#include <cstdlib>
 #include "mem_kernels.cuh"
 #include "pos_kernels.cuh"
 
@@ -20,6 +22,28 @@ void execute_cb_retrieve_plan(const torch::Device& device,
   // the caller's stream, so its completion event covers the whole plan.
   const at::cuda::OptionalCUDAGuard device_guard(device);
   at::cuda::CUDAStream compute_stream = at::cuda::getCurrentCUDAStream();
+  // Programmatic dependent launch for the scatters (Hopper+): overlaps each
+  // scatter's launch with the tail of its group's re-RoPE; the scatter kernel
+  // grid-dependency-syncs before reading the staged K. Attribute-only — the
+  // early-trigger form measurably regresses multi-group plans (dependent
+  // blocks occupy SMs while spinning). LMCACHE_CB_PDL=0 disables.
+  bool use_pdl = false;
+#if !defined(USE_ROCM) && defined(CUDART_VERSION) && CUDART_VERSION >= 11080
+  {
+    // device.index() is -1 for an index-less torch.device("cuda"); the
+    // guard above already selected the right device, so query the current
+    // one (an invalid ordinal would set a sticky CUDA error).
+    int cur_dev = 0;
+    int cc_major = 0;
+    if (cudaGetDevice(&cur_dev) == cudaSuccess &&
+        cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor,
+                               cur_dev) == cudaSuccess &&
+        cc_major >= 9) {
+      const char* env = std::getenv("LMCACHE_CB_PDL");
+      use_pdl = (env == nullptr || env[0] != '0');
+    }
+  }
+#endif
   at::cuda::CUDAStream copy_stream =
       at::cuda::getStreamFromPool(/*isHighPriority=*/false, device.index());
 
@@ -116,7 +140,8 @@ void execute_cb_retrieve_plan(const torch::Device& device,
             sc_bufs, sc_maps, sc_toks, group.paged_kv_ptrs, group.num_layers,
             group.slot_tokens, group.hidden_elems, group.element_size, device,
             group.page_buffer_size, TransferDirection::H2D,
-            group.engine_kv_format, group.block_size, group.head_size);
+            group.engine_kv_format, group.block_size, group.head_size,
+            /*block_stride_elems=*/0, use_pdl);
         sc_bufs.clear();
         sc_maps.clear();
         sc_toks.clear();

@@ -449,6 +449,14 @@ __global__ void load_and_reshape_multi_layer_fused_kernel(
     return;
   }
 
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  // Under a programmatic dependent launch the preceding kernel (the blend
+  // re-RoPE) may still be running: everything above reads only pre-kernel
+  // state (slot mappings, pointer tables); wait here before touching
+  // chunk.key_value. A no-op for classic launches.
+  cudaGridDependencySynchronize();
+#endif
+
   for (int i = tid; i < scalars_per_token; i += num_threads) {
     const int64_t lmcache_offset =
         key_value_offset(k_or_v, layer_id, token_id, i, scalars_per_token,
@@ -780,7 +788,7 @@ void multi_layer_kv_transfer_fused_templated(
     const int element_size, const torch::Device& paged_memory_device,
     const int page_buffer_size, const TransferDirection direction,
     const EngineKVFormat engine_kv_format, const int block_size,
-    const int head_size, const int64_t block_stride_elems) {
+    const int head_size, const int64_t block_stride_elems, const bool pdl) {
   const int n_chunks = static_cast<int>(key_values.size());
   TORCH_CHECK(n_chunks >= 1 && n_chunks <= MAX_FUSED_TRANSFER_CHUNKS,
               "fused transfer chunk count out of range: ", n_chunks);
@@ -824,8 +832,38 @@ void multi_layer_kv_transfer_fused_templated(
   const at::cuda::OptionalCUDAGuard device_guard(paged_memory_device);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-#ifndef LAUNCH_FUSED_WITH_FORMAT
+#if !defined(USE_ROCM) && defined(CUDART_VERSION) && CUDART_VERSION >= 11080
+  #define LAUNCH_FUSED_WITH_FORMAT(T_, DIR, FORMAT)                            \
+    if (pdl) {                                                                 \
+      /* Programmatic dependent launch: overlap this launch with the tail of  \
+         the preceding kernel; the kernel grid-dependency-syncs before        \
+         reading its output. Attribute-only (no early trigger) by design. */  \
+      cudaLaunchConfig_t lc{};                                                 \
+      lc.gridDim = grid;                                                       \
+      lc.blockDim = block;                                                     \
+      lc.stream = stream;                                                      \
+      cudaLaunchAttribute lattr[1];                                            \
+      lattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;        \
+      lattr[0].val.programmaticStreamSerializationAllowed = 1;                 \
+      lc.attrs = lattr;                                                        \
+      lc.numAttrs = 1;                                                         \
+      C10_CUDA_CHECK(cudaLaunchKernelEx(                                       \
+          &lc,                                                                 \
+          lmc::load_and_reshape_multi_layer_fused_kernel<T_, DIR, FORMAT>,     \
+          pack, page_buffer_ptrs, k_or_v_size, num_xwords, num_tokens,         \
+          num_layers, page_buffer_size, block_size, head_size_xword,           \
+          block_stride_xwords));                                               \
+    } else {                                                                   \
+      lmc::load_and_reshape_multi_layer_fused_kernel<T_, DIR, FORMAT>          \
+          <<<grid, block, 0, stream>>>(pack, page_buffer_ptrs, k_or_v_size,    \
+                                       num_xwords, num_tokens, num_layers,     \
+                                       page_buffer_size, block_size,           \
+                                       head_size_xword, block_stride_xwords);  \
+      C10_CUDA_KERNEL_LAUNCH_CHECK();                                          \
+    }
+#else
   #define LAUNCH_FUSED_WITH_FORMAT(T_, DIR, FORMAT)                         \
+    (void)pdl;                                                              \
     lmc::load_and_reshape_multi_layer_fused_kernel<T_, DIR, FORMAT>         \
         <<<grid, block, 0, stream>>>(pack, page_buffer_ptrs, k_or_v_size,   \
                                      num_xwords, num_tokens, num_layers,    \
@@ -899,7 +937,7 @@ void multi_layer_kv_transfer_fused_ptr(
     const int element_size, const torch::Device& paged_memory_device,
     const int page_buffer_size, const TransferDirection direction,
     const EngineKVFormat engine_kv_format, const int block_size,
-    const int head_size, const int64_t block_stride_elems) {
+    const int head_size, const int64_t block_stride_elems, const bool pdl) {
   int copy_size = num_origin_elements * element_size;
 #ifndef LAUNCH_FUSED_TRANSFER
   #define LAUNCH_FUSED_TRANSFER(type)                                         \
@@ -908,7 +946,7 @@ void multi_layer_kv_transfer_fused_ptr(
           key_values, slot_mappings, n_toks, page_buffer_ptrs, num_layers,    \
           layout_num_tokens, num_origin_elements, element_size,               \
           paged_memory_device, page_buffer_size, direction, engine_kv_format, \
-          block_size, head_size, block_stride_elems);                         \
+          block_size, head_size, block_stride_elems, pdl);                    \
     } while (0)
 #endif
   if (copy_size % 8 == 0) {
